@@ -60,6 +60,7 @@ pub enum GovError {
     QuorumNotReached = 8,
     GovernanceNotInitialized = 9,
     WhitelistMustNotBeEmpty = 10,
+    ProposalNotFound = 11
 }
 
 #[contract]
@@ -241,7 +242,7 @@ impl Governance {
             .storage()
             .instance()
             .get(&DataKey::Proposal(proposal_id))
-            .unwrap();
+            .ok_or(GovError::ProposalNotFound)?;
         Ok(proposal)
     }
 

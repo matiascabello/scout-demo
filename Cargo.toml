@@ -1,31 +1,61 @@
 [package]
-name = "governance"
+name = "pallet-static-price-provider"
 version = "0.1.0"
-edition = "2021"
-
-
-[lib]
-crate-type = ["cdylib"]
+license = "GPL-3.0-or-later"
+description = "Static price provider for native currency"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
 
 [dependencies]
-soroban-sdk = "20.0.0"
+log = { workspace = true }
+parity-scale-codec = { workspace = true }
+serde = { workspace = true }
 
-[dev_dependencies]
-soroban-sdk = { version = "20.0.0", features = ["testutils"] }
+astar-primitives = { workspace = true }
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+scale-info = { workspace = true }
+sp-arithmetic = { workspace = true }
+sp-runtime = { workspace = true }
+sp-std = { workspace = true }
+
+frame-benchmarking = { workspace = true, optional = true }
+
+[dev-dependencies]
+pallet-balances = { workspace = true }
+sp-core = { workspace = true }
+sp-io = { workspace = true }
 
 [features]
-testutils = ["soroban-sdk/testutils"]
-
-[profile.release]
-opt-level = "z"
-overflow-checks = true
-debug = 0
-strip = "symbols"
-debug-assertions = false
-panic = "abort"
-codegen-units = 1
-lto = true
-
-[profile.release-with-logs]
-inherits = "release"
-debug-assertions = true
+default = ["std"]
+std = [
+	"parity-scale-codec/std",
+	"log/std",
+	"sp-core/std",
+	"scale-info/std",
+	"serde/std",
+	"sp-std/std",
+	"frame-support/std",
+	"frame-system/std",
+	"pallet-balances/std",
+	"astar-primitives/std",
+	"sp-arithmetic/std",
+	"frame-benchmarking?/std",
+	"sp-runtime/std",
+]
+runtime-benchmarks = [
+	"frame-benchmarking",
+	"frame-support/runtime-benchmarks",
+	"frame-system/runtime-benchmarks",
+	"sp-runtime/runtime-benchmarks",
+	"astar-primitives/runtime-benchmarks",
+	"frame-benchmarking/runtime-benchmarks",
+]
+try-runtime = [
+	"frame-support/try-runtime",
+	"astar-primitives/try-runtime",
+	"frame-system/try-runtime",
+	"sp-runtime/try-runtime",
+]

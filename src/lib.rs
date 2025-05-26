@@ -1,258 +1,207 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
 };
 
 #[contracttype]
-pub enum DataKey {
-    GovState,
-    Proposal(u32),
-    Vote(u32, Address),
-}
-
-#[derive(Default)]
-#[contracttype]
-pub struct Vote {
-    active: bool,
-    value: bool,
-}
-
-#[derive(Debug, Clone)]
-#[contracttype]
-pub struct Proposal {
-    pub executed: bool,
-    pub expiration_date: u32, // The timestamp when the proposal can no longer be voted on.
-    pub positive_votes: u32,
-    pub negative_votes: u32,
-    pub tx: Transaction,
-}
-
-#[derive(Debug, Clone)]
-#[contracttype]
-pub struct Transaction {
-    pub contract_id: Address, // The address of the contract the tx will invoke if approved.
-    pub function: Symbol,     // The function to be invoked if approved.
-    pub func_arguments: Vec<Val>, // The parameters to the function.
-}
-
-#[contracttype]
-#[derive(Debug, Clone)]
-pub struct GovState {
-    next_tx_id: u32,                       // Next proposal id to be assigned.
-    supermajority: bool, // Indicates whether the amount of positive votes has to be higher than 50%.
-    supermajority_percentage: Option<u32>, // Indicates the minimum percentage the amount of positive votes has to reach. For example, 80% over total votes.
-    voting_period: u32, // Indicates how much time the voting of a proposal remains open from the moment of its creation.
-    whitelist: Vec<Address>,
-    quorum: u32,
+pub struct PaymentChannelState {
+    sender: Address,    // The creator of the payment channel who wants to send funds.
+    recipient: Address, // The receiver of the deposited funds.
+    expiration: Option<u32>, // The sequence corresponding to the date the channel is no longer valid.
+    withdrawn: i128,         // The amount that has already been withdrawn by the recipient.
+    token: Address,          // The token the deposit is being made in.
+    allowance: i128, // The maximum amount the recipient is allowed to withdraw. Sender can update this amount but all withdrawals will sum up to this number.
+                     /* Example:
+                         1. first allowance: 1000 tokens
+                         2. user withdrawal: 1000 tokens
+                         3. sender updates allowance to 1700 tokens
+                         4. user second withdrawal will be of 700 because of previous withdrawal.
+                         5. user's final balance: 1700 tokens
+                     */
 }
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
-pub enum GovError {
-    InvalidSupermajorityPercentage = 1,
-    GovernanceAlreadyInitialized = 2,
-    InvalidQuorumValue = 3,
-    AddressNotInWhitelist = 4,
-    ProposalAlreadyExecuted = 5,
-    UserAlreadyVoted = 6,
-    InvalidProposalId = 7,
-    QuorumNotReached = 8,
-    GovernanceNotInitialized = 9,
-    WhitelistMustNotBeEmpty = 10,
+pub enum PCError {
+    ExpirationNotSet = 1,
+    CouldNotRetrieveState = 2,
+    PaymentChannelAlreadyInitialized = 3,
+    ChannelStillHasNotExpired = 4,
+    NewExpirationCannotBeInThePast = 5,
+    ChannelWasCreatedAsNonExpiring = 6,
 }
+
+const PCSTATE: Symbol = symbol_short!("PC_STATE");
 
 #[contract]
-pub struct Governance;
+pub struct PaymentChannel;
 
 #[contractimpl]
-impl Governance {
+impl PaymentChannel {
     pub fn initialize(
         env: Env,
-        supermajority: bool,
-        supermajority_percentage: Option<u32>,
-        voting_period: u32,
-        whitelist: Vec<Address>,
-        quorum: u32,
-    ) -> Result<(), GovError> {
-        let state = Self::get_state(env.clone());
-        if state.is_ok() {
-            return Err(GovError::GovernanceAlreadyInitialized);
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        allowance: i128,
+        expiration: Option<u32>,
+    ) -> Result<PaymentChannelState, PCError> {
+        let state_op = Self::get_state(env.clone());
+        if state_op.is_ok() {
+            return Err(PCError::PaymentChannelAlreadyInitialized);
         }
-        if !(whitelist.len() > 0) {
-            return Err(GovError::WhitelistMustNotBeEmpty)
-        }
-        if !(quorum > 0 && quorum <= 100) {
-            return Err(GovError::InvalidQuorumValue);
-        }
-        if supermajority {
-            match supermajority_percentage {
-                Some(x) => assert!(x <= 100 && x > 50),
-                None => return Err(GovError::InvalidSupermajorityPercentage),
-            }
-        }
-
-        let new_gov_state = GovState {
-            next_tx_id: 0,
-            supermajority,
-            supermajority_percentage,
-            voting_period,
-            whitelist,
-            quorum,
+        let new_payment_channel = PaymentChannelState {
+            sender: sender.clone(),
+            recipient,
+            expiration,
+            withdrawn: 0,
+            token: token.clone(),
+            allowance,
         };
+        sender.require_auth();
+        let token_client = token::Client::new(&env, &token);
 
-        env.storage()
-            .instance()
-            .set(&DataKey::GovState, &new_gov_state);
-        Ok(())
-    }
-
-    pub fn propose_tx(
-        env: Env,
-        contract_id: Address,
-        func_name: Symbol,
-        func_args: Vec<Val>,
-        caller: Address,
-    ) -> Result<(), GovError> {
-        let mut state = Self::get_state(env.clone())?;
-
-        if !Self::whitelisted(state.clone(), caller.clone()) {
-            return Err(GovError::AddressNotInWhitelist);
-        }
-        let now = env.ledger().sequence();
-        let proposal_id = state.next_tx_id;
-        state.next_tx_id += 1;
-
-        let new_tx = Transaction {
-            contract_id,
-            function: func_name,
-            func_arguments: func_args,
-        };
-
-        let new_proposal = Proposal {
-            executed: false,
-            expiration_date: now + state.voting_period,
-            positive_votes: 0,
-            negative_votes: 0,
-            tx: new_tx,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &new_proposal);
-        env.storage().instance().set(&DataKey::GovState, &state);
-        Ok(())
-    }
-
-    pub fn vote_proposal(
-        env: Env,
-        voter: Address,
-        proposal_id: u32,
-        vote_value: bool,
-    ) -> Result<(), GovError> {
-        let state = Self::get_state(env.clone())?;
-        let mut proposal = Self::get_proposal(env.clone(), proposal_id)?;
-        let now = env.ledger().sequence();
-
-        if !Self::whitelisted(state.clone(), voter.clone()) {
-            return Err(GovError::AddressNotInWhitelist);
-        }
-        voter.require_auth();
-
-        assert!(now <= proposal.expiration_date);
-        let vote = Self::get_vote(env.clone(), proposal_id.clone(), voter.clone());
-        if vote.active {
-            return Err(GovError::UserAlreadyVoted);
-        }
-
-        env.storage().instance().set(
-            &DataKey::Vote(proposal_id, voter),
-            &Vote {
-                active: true,
-                value: vote_value,
-            },
+        token_client.approve(
+            &sender,
+            &env.current_contract_address(),
+            &allowance,
+            &env.ledger().sequence(),
         );
+        token_client.transfer_from(
+            &env.current_contract_address(),
+            &sender,
+            &env.current_contract_address(),
+            &allowance,
+        );
+        env.storage().instance().set(&PCSTATE, &new_payment_channel);
+        Ok(new_payment_channel)
+    }
 
-        if vote_value {
-            proposal.positive_votes += 1;
+    pub fn get_state(env: Env) -> Result<PaymentChannelState, PCError> {
+        let state_op = env.storage().instance().get(&PCSTATE);
+        if let Some(state) = state_op {
+            Ok(state)
         } else {
-            proposal.negative_votes += 1;
+            Err(PCError::CouldNotRetrieveState)
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(proposal_id), &proposal);
+    }
+
+    pub fn close(env: Env) -> Result<(), PCError> {
+        let state = Self::get_state(env.clone())?;
+        let recipient = Self::get_recipient_address(env.clone())?;
+        recipient.require_auth();
+        let token_client = token::Client::new(&env, &Self::get_state(env.clone())?.token);
+
+        if state.allowance > state.withdrawn {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &(state.allowance - state.withdrawn),
+            );
+        }
+        let remaining_balance = token_client.balance(&env.current_contract_address());
+        if remaining_balance > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &Self::get_sender_address(env)?,
+                &remaining_balance,
+            );
+        }
         Ok(())
     }
 
-    pub fn close_proposal(env: Env, proposal_id: u32) -> Result<(), GovError> {
-        let state = Self::get_state(env.clone())?;
-        let proposal = Self::get_proposal(env.clone(), proposal_id)?;
-        assert!(proposal.expiration_date < env.ledger().sequence());
-        if proposal.executed {
-            return Err(GovError::ProposalAlreadyExecuted);
-        }
-        let total_votes = proposal.positive_votes + proposal.negative_votes;
-        let min_votes_multiplied_100 = state.whitelist.len() * state.quorum;
-
-        if total_votes * 100 < min_votes_multiplied_100 {
-            return Err(GovError::QuorumNotReached);
-        }
-
-        match state.supermajority {
-            true => {
-                let percentage = state.supermajority_percentage.unwrap();
-
-                if proposal.positive_votes * 100 >= (total_votes * percentage) {
-                    let _res: Val = env.invoke_contract(
-                        &proposal.tx.contract_id,
-                        &proposal.tx.function,
-                        proposal.tx.func_arguments,
-                    );
-                }
-            }
-            false => {
-                if proposal.positive_votes > proposal.negative_votes {
-                    let _res: Val = env.invoke_contract(
-                        &proposal.tx.contract_id,
-                        &proposal.tx.function,
-                        proposal.tx.func_arguments,
-                    );
-                }
-            }
-        };
+    pub fn withdraw(env: Env) -> Result<(), PCError> {
+        Self::get_recipient_address(env.clone())?.require_auth();
+        let mut state = Self::get_state(env.clone())?;
+        assert!(state.allowance > state.withdrawn);
+        let token_client = token::Client::new(&env, &state.token);
+        let amount_to_withdraw = state.allowance - state.withdrawn;
+        state.withdrawn += amount_to_withdraw;
+        token_client.transfer(
+            &env.current_contract_address(),
+            &state.recipient,
+            &amount_to_withdraw,
+        );
+        env.storage().instance().set(&PCSTATE, &state);
         Ok(())
     }
 
-    pub fn get_state(env: Env) -> Result<GovState, GovError> {
-        let state_op = env.storage().instance().get(&DataKey::GovState);
-        if state_op.is_some() {
-            Ok(state_op.unwrap())
-        } else {
-            Err(GovError::GovernanceNotInitialized)
+    pub fn set_expiration(env: Env, sequence: u32) -> Result<(), PCError> {
+        let mut state = Self::get_state(env.clone())?;
+        Self::get_sender_address(env.clone())?.require_auth();
+        let now = env.ledger().sequence();
+
+        match state.expiration {
+            Some(expiration) => {
+                if now < expiration {
+                    return Err(PCError::ChannelStillHasNotExpired);
+                }
+            }
+            None => return Err(PCError::ChannelWasCreatedAsNonExpiring),
         }
+
+        if sequence <= now {
+            return Err(PCError::NewExpirationCannotBeInThePast);
+        }
+
+        state.expiration = Some(sequence);
+        env.storage().instance().set(&PCSTATE, &state);
+        Ok(())
     }
 
-    pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, GovError> {
+    pub fn claim_timeout(env: Env) -> Result<(), PCError> {
         let state = Self::get_state(env.clone())?;
-        if proposal_id >= state.next_tx_id {
-            return Err(GovError::InvalidProposalId);
+        state.sender.require_auth();
+        match state.expiration {
+            Some(expiration) => {
+                let now = env.ledger().sequence();
+                assert!(now > expiration);
+                let token_client = token::Client::new(&env, &state.token);
+                let remaining_balance = token_client.balance(&env.current_contract_address());
+                if remaining_balance > 0 {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &state.sender,
+                        &remaining_balance,
+                    );
+                }
+                Ok(())
+            }
+            None => Err(PCError::ExpirationNotSet),
         }
-        let proposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::Proposal(proposal_id))
-            .unwrap();
-        Ok(proposal)
     }
 
-    pub fn whitelisted(state: GovState, caller: Address) -> bool {
-        state.whitelist.contains(caller)
+    pub fn modify_allowance(env: Env, allowance: i128) -> Result<(), PCError> {
+        let mut state = Self::get_state(env.clone())?;
+        let token_client = token::Client::new(&env, &Self::get_state(env.clone())?.token);
+        state.sender.require_auth();
+        assert!(allowance > state.allowance);
+        token_client.approve(
+            &state.sender,
+            &env.current_contract_address(),
+            &(allowance - state.allowance),
+            &env.ledger().sequence(),
+        );
+        token_client.transfer_from(
+            &env.current_contract_address(),
+            &state.sender,
+            &env.current_contract_address(),
+            &(allowance - state.allowance),
+        );
+        state.allowance = allowance;
+        env.storage().instance().set(&PCSTATE, &state);
+        Ok(())
     }
 
-    pub fn get_vote(env: Env, proposal_id: u32, voter: Address) -> Vote {
-        env.storage()
-            .instance()
-            .get(&DataKey::Vote(proposal_id, voter))
-            .unwrap_or_default()
+    pub fn get_recipient_address(env: Env) -> Result<Address, PCError> {
+        Ok(Self::get_state(env)?.recipient)
+    }
+
+    pub fn get_sender_address(env: Env) -> Result<Address, PCError> {
+        Ok(Self::get_state(env)?.sender)
     }
 }
+
+#[cfg(test)]
+mod test;
